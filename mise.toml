@@ -1,0 +1,219 @@
+# mise tasks for building this project.
+#   https://mise.jdx.dev
+#
+# Everything here is a thin wrapper around the Makefile -- `make <target>` always
+# works too. mise just gives you the whole setup as one command and remembers to
+# use a sensible job count.
+#
+# agbcc must be a SIBLING of this repo, because its installer is invoked as
+# `./install.sh ../pokeruby`:
+#
+#   decomp/
+#   |-- agbcc/         <- https://github.com/pret/agbcc
+#   `-- pokeruby/      <- this repo
+#
+# Run `mise tasks ls` to see everything. `mise run doctor` is the one to run first
+# if something is broken.
+
+[settings]
+# Don't saturate every core and spin the fans to max. Override per-run with
+# `make -j8`, or raise `jobs` here.
+jobs = 4
+
+[env]
+# Applies -j4 to every plain `make`, including the recursive $(MAKE) calls the
+# Makefile uses for its `sapphire_rev2`-style target aliases.
+MAKEFLAGS = "-j4"
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+# These are OS packages, not mise-managed tools -- mise has no pacman backend.
+# Everything else in this file assumes they are present. On Debian/Ubuntu the
+# equivalent list is: build-essential git libpng-dev perl binutils-arm-none-eabi
+#
+#   base-devel              -> gcc, g++, make, cpp, binutils (host C toolchain;
+#                              agbcc is itself built with this)
+#   arm-none-eabi-binutils  -> arm-none-eabi-{as,ld,objcopy,objdump}; assembles
+#                              and links the GBA ROM. Required, no substitute.
+#   libpng                  -> the repo's graphics tools (gbagfx) link against it
+#   perl                    -> used by the `syms` target
+#   git
+#
+# NOT needed: arm-none-eabi-gcc, as long as the Makefile uses the host `cpp`.
+# See the note in `doctor` below -- pokeruby needs a preprocessor that copes with
+# both its .s pipeline and its sym_*.txt files, and `cc -E` does not.
+
+[tasks.deps]
+description = "Install system packages needed to build (needs sudo)"
+run = """
+sudo pacman -S --needed \
+  base-devel \
+  arm-none-eabi-binutils \
+  libpng \
+  perl \
+  git
+"""
+
+[tasks.modern-deps]
+description = "Optional: install devkitARM, only needed for `make modern` (needs sudo)"
+run = """
+sudo pacman -S --needed arm-none-eabi-gcc
+"""
+
+# ---------------------------------------------------------------------------
+# Checking / troubleshooting
+# ---------------------------------------------------------------------------
+
+[tasks.doctor]
+description = "Verify the toolchain and the agbcc install look sane"
+run = """
+set -eu
+fail=0
+for t in gcc g++ make cpp git perl arm-none-eabi-as arm-none-eabi-ld arm-none-eabi-objcopy; do
+  if command -v "$t" >/dev/null 2>&1; then
+    printf '  ok   %s\\n' "$t"
+  else
+    printf '  MISS %s   <- mise run deps\\n' "$t"
+    fail=1
+  fi
+done
+if pkg-config --exists libpng 2>/dev/null; then
+  printf '  ok   libpng %s\\n' "$(pkg-config --modversion libpng)"
+else
+  printf '  MISS libpng   <- mise run deps\\n'
+  fail=1
+fi
+if [ -x tools/agbcc/bin/agbcc ]; then
+  printf '  ok   agbcc installed\\n'
+else
+  printf '  MISS agbcc   <- mise run agbcc:install\\n'
+  fail=1
+fi
+
+# Unlike pokefirered, this Makefile generates its sym_*.ld linker fragments with
+# the C preprocessor rather than ramscrgen. It needs a cpp that will preprocess a
+# .txt file -- `cc -E` refuses to, because it treats an unknown extension as a
+# linker input. So `cpp` (host) or arm-none-eabi-cpp both work; `cc -E` does not.
+cpp_ok=0
+if grep -qE 'CPP +:= +cpp' Makefile && command -v cpp >/dev/null 2>&1; then
+  cpp_ok=1
+elif command -v arm-none-eabi-cpp >/dev/null 2>&1; then
+  cpp_ok=1
+fi
+if [ "$cpp_ok" = 1 ]; then
+  printf '  ok   preprocessor usable by Makefile\\n'
+else
+  printf '  MISS usable preprocessor -- need host `cpp`, or arm-none-eabi-cpp\\n'
+  fail=1
+fi
+exit $fail
+"""
+
+# ---------------------------------------------------------------------------
+# agbcc -- build the compiler that matches the original ROM byte-for-byte
+# ---------------------------------------------------------------------------
+
+[tasks.agbcc]
+description = "Build agbcc from source (first time, and after changing agbcc)"
+dir = "{{config_root}}/../agbcc"
+run = "./build.sh"
+
+[tasks."agbcc:install"]
+description = "Install the built agbcc into this repo"
+depends = ["agbcc"]
+dir = "{{config_root}}/../agbcc"
+run = "./install.sh ../pokeruby"
+
+[tasks."agbcc:clean"]
+description = "Delete agbcc build artifacts so the next build is from scratch"
+dir = "{{config_root}}/../agbcc"
+run = """
+git clean -fX
+"""
+
+[tasks.setup]
+description = "First-time setup: system deps, then build+install agbcc"
+depends = ["deps", "agbcc:install"]
+
+# ---------------------------------------------------------------------------
+# Building ROMs
+# ---------------------------------------------------------------------------
+# The Makefile writes each ROM to this directory as poke<target>.gba. There is no
+# baserom.gba needed to build; the <target>.sha1 files are what `build` checks the
+# result against.
+#
+#   mise run build              all six ROMs
+#   mise run build:sapphire     just one
+#
+# Note `sapphire_switch` does not exist here -- that is a pokefirered-only
+# revision. Ruby/Sapphire revisions are 1 and 2 instead.
+#
+# Once you start editing, a ROM legitimately stops matching its .sha1. That is
+# information, not an error, so `build` reports it and still exits 0.
+
+[tasks.build]
+description = "Build all six ROMs and report retail match status"
+run = """
+set -eu
+for rom in ruby ruby_rev1 ruby_rev2 sapphire sapphire_rev1 sapphire_rev2; do
+  make "$rom"
+done
+echo
+printf '%-26s %-17s %s\\n' ROM SHA1 STATUS
+printf '%-26s %-17s %s\\n' -------------------------- ----------------- ------------------------
+for rom in ruby ruby_rev1 ruby_rev2 sapphire sapphire_rev1 sapphire_rev2; do
+  f="poke$rom.gba"
+  if [ ! -f "$f" ]; then
+    continue
+  fi
+  sum=$(sha1sum "$f" | cut -d' ' -f1)
+  if [ -f "$rom.sha1" ] && sha1sum -c "$rom.sha1" >/dev/null 2>&1; then
+    rom_status="matches retail"
+  else
+    rom_status="modified (not retail)"
+  fi
+  printf '%-26s %-17s %s\n' "$f" "$(printf '%s' "$sum" | cut -c1-16)" "$rom_status"
+done
+"""
+
+[tasks."build:ruby"]
+description = "Build only ruby (v1.0)"
+run = "make ruby"
+
+[tasks."build:ruby_rev1"]
+description = "Build only ruby_rev1 (v1.1)"
+run = "make ruby_rev1"
+
+[tasks."build:ruby_rev2"]
+description = "Build only ruby_rev2 (v1.2)"
+run = "make ruby_rev2"
+
+[tasks."build:sapphire"]
+description = "Build only sapphire (v1.0)"
+run = "make sapphire"
+
+[tasks."build:sapphire_rev1"]
+description = "Build only sapphire_rev1 (v1.1)"
+run = "make sapphire_rev1"
+
+[tasks."build:sapphire_rev2"]
+description = "Build only sapphire_rev2 (v1.2)"
+run = "make sapphire_rev2"
+
+[tasks.syms]
+description = "Dump pokeruby.sym -- symbol name/address list, handy when hacking"
+run = "make syms"
+
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+[tasks.clean]
+description = "Remove build output and all generated assets"
+run = "make clean"
+
+[tasks."clean:all"]
+description = "clean the decomp build and reset agbcc's artifacts"
+depends = ["clean", "agbcc:clean"]
+run = ""
